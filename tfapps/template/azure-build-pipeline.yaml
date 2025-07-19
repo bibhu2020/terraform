@@ -1,0 +1,330 @@
+trigger:
+  none
+
+pr:
+  none  
+
+pool:
+  vmImage: 'ubuntu-latest'  # Use the latest Ubuntu image for your build 
+
+variables:
+  - group: terraform_variable_group  # Load variables from the Variable Group
+  - name: 'backendServiceArm'
+    value: 'azuredevops-fic' 
+  - name: 'backendAzureRmResourceGroupName'
+    value: '$(terraform_backend_storage_resource_group)' 
+  - name: 'backendAzureRmStorageAccountName'
+    value: '$(terraform_backend_storage_account)' 
+  - name: 'backendAzureRmContainerName'
+    value: '$(terraform_backend_storage_container)' 
+  - name: 'backendAzureRmKey'  
+    value: '$(terraform_app)-$(terraform_env).tfstate'
+  - name: 'workingDirectory'
+    value: '$(Build.SourcesDirectory)/tfapps/$(terraform_app)'
+  - name: 'unzipDirectory'
+    value: '$(Pipeline.Workspace)/terraform/unzipped/tfapps/$(terraform_app)'
+
+
+stages:
+  - stage: Build
+    displayName: 'Build Stage'
+    jobs:
+      - job: TerraformPipeline
+        displayName: 'Terraform Build'
+        steps:
+          # Step 1: Install Terraform using the Azure DevOps Terraform extension
+          - task: TerraformInstaller@1
+            inputs:
+              terraformVersion: $(terraformVersion)
+            displayName: 'Install Terraform'
+
+          # Step 2: Remove unnecessary files & folders from the build so that deployment size reduces
+          - task: Bash@3
+            inputs:
+              targetType: 'inline'
+              script: |
+                echo "Cleaning up unnecessary directories..."
+                cd $(Build.SourcesDirectory)
+                rm -rf _psmodules/
+                rm -rf archives/
+                rm -rf pocs/
+                rm -rf utilityapps/
+                rm -rf tfapps/isv/
+                rm -rf tfapps/isv_db/
+                rm -rf tfapps/isv_db_archive/
+                rm -rf .git/
+                rm -rf .github/
+                echo "Remaining files in source directory:"
+                ls -la
+            displayName: 'Cleanup Source Directory'
+
+          # Step 3: create terraform.tfvars file
+          - task: Bash@3
+            displayName: 'Create terraform.tfvars file'
+            inputs:
+              targetType: 'inline'
+              script: |
+                # Generate terraform.tfvars with values from Azure Pipeline variables
+                echo "app = \"$(terraform_app)\"" > terraform.tfvars
+                echo "env = \"$(terraform_env)\"" >> terraform.tfvars
+                echo "location = \"$(terraform_location)\"" >> terraform.tfvars
+                echo "subscription_id = \"$(terraform_subscription_id)\"" >> terraform.tfvars
+                echo "tenant_id = \"$(terraform_tenant_id)\"" >> terraform.tfvars
+                echo "owner = \"$(terraform_owner)\"" >> terraform.tfvars
+                echo "co-owner = \"$(terraform_co-owner)\"" >> terraform.tfvars
+                echo "workitem = \"$(terraform_workitem)\"" >> terraform.tfvars
+                # Optional: Display the contents of terraform.tfvars to verify
+                cat terraform.tfvars
+                mv  terraform.tfvars   $(workingDirectory)/ 
+
+          # Step 4: create backend.tf file
+          - task: Bash@3
+            displayName: 'Create backend.tf file'
+            inputs:
+              targetType: 'inline'
+              script: |
+                # Generate backend.tf with values from Azure Pipeline variables
+                echo "terraform {" > backend.tf
+                echo "  backend \"azurerm\" {" >> backend.tf
+                echo "    resource_group_name  = \"$(backendAzureRmResourceGroupName)\"" >> backend.tf
+                echo "    storage_account_name  = \"$(backendAzureRmStorageAccountName)\"" >> backend.tf
+                echo "    container_name  = \"$(backendAzureRmContainerName)\"" >> backend.tf
+                echo "    key  = \"$(backendAzureRmKey)\"" >> backend.tf
+                echo "    use_azuread_auth  = true" >> backend.tf
+                echo "  }" >> backend.tf
+                echo "}" >> backend.tf
+                # Optional: Display the contents of terraform.tfvars to verify
+                cat backend.tf
+                mv  backend.tf   $(workingDirectory)/ 
+
+          # Step 5: Initialize Terraform
+          - task: TerraformTaskV4@4
+            inputs:
+              provider: 'azurerm'  # Adjust this if using another provider
+              command: 'init'
+              workingDirectory: '$(workingDirectory)'
+              backendAzureRmUseEnvironmentVariablesForAuthentication: true
+              backendAzureRmUseEntraIdForAuthentication: true
+              backendAzureRmResourceGroupName: $(backendAzureRmResourceGroupName)
+              backendAzureRmStorageAccountName: $(backendAzureRmStorageAccountName)
+              backendAzureRmContainerName: $(backendAzureRmContainerName)
+              backendAzureRmKey: $(backendAzureRmKey)
+              backendServiceArm: '$(backendServiceArm)' 
+            displayName: 'Terraform Init'
+
+          # Step 6: Validate Terraform code
+          - task: TerraformTaskV4@4
+            inputs:
+              provider: 'azurerm'
+              command: 'validate'
+              workingDirectory: '$(workingDirectory)'
+              backendServiceArm: '$(backendServiceArm)'
+            displayName: 'Terraform Validate'
+
+          # Step 8: Run Terraform Plan and save the plan to a file
+          - task: TerraformTaskV4@4
+            inputs:
+              provider: 'azurerm'
+              command: 'plan'
+              commandOptions: '-out $(workingDirectory)/main.tfplan'
+              workingDirectory: '$(workingDirectory)'
+              backendServiceArm: '$(backendServiceArm)'
+              environmentServiceNameAzureRM: '$(backendServiceArm)'
+            displayName: 'Terraform Plan'
+
+          # Step 9: Archive the Terraform Plan
+          - task: ArchiveFiles@2
+            displayName: Archive files
+            inputs:
+              rootFolderOrFile: '$(Build.SourcesDirectory)/'
+              includeRootFolder: false
+              archiveType: 'zip'
+              archiveFile: '$(Build.ArtifactStagingDirectory)/$(Build.BuildId).zip'
+              replaceExistingArchive: true  
+
+          # Step 10: Publish Terraform Plan as an Artifact for Release Pipeline
+          - task: PublishBuildArtifacts@1
+            inputs:
+              targetPath: 'terraform'
+              artifactName: '$(Build.BuildId)-build'
+            displayName: 'Publish Terraform Plan Artifact'
+
+  - stage: DeployApproval
+    displayName: 'Approval Gate - Setup Infrastructure'
+    dependsOn: Build
+    condition: eq(variables['terraform_action'], 'apply')
+    jobs:
+      - job: WaitForValidation
+        displayName: 'Wait for Validation and Approval'
+        pool: server
+        timeoutInMinutes: 4320 # 3 days
+        steps:
+          - task: ManualValidation@0
+            inputs:
+              notifyUsers: |
+                v-bimishra@outlook.com
+              instructions: 'Please validate the Terraform plan and approve the deployment'
+              onTimeout: 'reject'
+
+  - stage: Deploy
+    displayName: 'Deploy Infrastructure'
+    dependsOn: DeployApproval
+    condition: succeeded('DeployApproval')
+    jobs:
+      - job: ApplyTerraform
+        displayName: 'Apply Terraform'
+        steps:
+          # Step 1: Install Terraform
+          - task: TerraformInstaller@1
+            inputs:
+              terraformVersion: $(terraformVersion)
+            displayName: 'Install Terraform'
+
+          # Step 2: Download the Terraform plan artifact
+          - task: DownloadPipelineArtifact@2
+            inputs:
+              artifactName: '$(Build.BuildId)-build'
+              downloadPath: 'terraform'
+              targetPath: '$(Pipeline.Workspace)/terraform'
+            displayName: 'Download Terraform Plan'
+
+          # Add debug step to verify download
+          - task: Bash@3
+            inputs:
+              targetType: 'inline'
+              script: |
+                echo "Listing downloaded content:"
+                ls -la $(Pipeline.Workspace)/terraform/
+            displayName: 'Debug - List Downloads'  
+
+          # Step 3: unzip the build
+          - task: ExtractFiles@1
+            inputs:
+              archiveFilePatterns: '$(Pipeline.Workspace)/terraform/$(Build.BuildId).zip'  # Path to your downloaded .zip file
+              destinationFolder: '$(Pipeline.Workspace)/terraform/unzipped'  # Folder where you want the files extracted
+            displayName: 'Extract Terraform Plan'
+
+          # Add debug step after extraction
+          - task: Bash@3
+            inputs:
+              targetType: 'inline'
+              script: |
+                echo "Listing extracted content:"
+                ls -la $(Pipeline.Workspace)/terraform/unzipped/
+            displayName: 'Debug - List Extracted Files'
+
+          # Step 4: Initialize Terraform
+          - task: TerraformTaskV4@4
+            inputs:
+              provider: 'azurerm'
+              command: 'init'
+              workingDirectory: '$(unzipDirectory)'
+              backendAzureRmUseEnvironmentVariablesForAuthentication: true
+              backendAzureRmUseEntraIdForAuthentication: true
+              backendAzureRmResourceGroupName: $(backendAzureRmResourceGroupName)
+              backendAzureRmStorageAccountName: $(backendAzureRmStorageAccountName)
+              backendAzureRmContainerName: $(backendAzureRmContainerName)
+              backendAzureRmKey: $(backendAzureRmKey)
+              backendServiceArm: '$(backendServiceArm)' 
+            displayName: 'Terraform Init'
+
+          # Step 5: Apply Terraform Plan
+          - task: TerraformTaskV4@4
+            inputs:
+              provider: 'azurerm'
+              command: 'apply'
+              commandOptions: '-auto-approve -input=false $(unzipDirectory)/main.tfplan'
+              workingDirectory: '$(unzipDirectory)'
+              backendServiceArm: '$(backendServiceArm)' 
+              environmentServiceNameAzureRM: '$(backendServiceArm)'
+            displayName: 'Terraform Apply'
+
+  ##Run the destroy only in the PoC environment where you run the script first for testing. (in Limabean v2 subscription)
+  - stage: DestroyApproval
+    displayName: 'Approval Gate - Destroy Infrastructure'
+    condition: or(succeeded('Deploy'), eq(variables['terraform_action'], 'destroy'))
+    jobs:
+      - job: WaitForValidation
+        displayName: 'Wait for Validation and Approval'
+        pool: server
+        timeoutInMinutes: 4320 # 3 days
+        steps:
+          - task: ManualValidation@0
+            inputs:
+              notifyUsers: |
+                v-bimishra@outlook.com
+              instructions: 'Please validate the Terraform plan and approve the deployment'
+              onTimeout: 'reject'
+
+  - stage: Destroy
+    displayName: 'Destroy Infrastructure'
+    dependsOn: DestroyApproval
+    condition: succeeded('DestroyApproval')
+    jobs:
+      - job: ApplyTerraform
+        displayName: 'Destroy Terraform'
+        steps:
+          # Step 1: Install Terraform
+          - task: TerraformInstaller@1
+            inputs:
+              terraformVersion: $(terraformVersion)
+            displayName: 'Install Terraform'
+
+          # Step 2: Download the Terraform plan artifact
+          - task: DownloadPipelineArtifact@2
+            inputs:
+              artifactName: '$(Build.BuildId)-build'
+              downloadPath: 'terraform'
+              targetPath: '$(Pipeline.Workspace)/terraform'
+            displayName: 'Download Terraform Plan'
+
+          # Add debug step to verify download
+          - task: Bash@3
+            inputs:
+              targetType: 'inline'
+              script: |
+                echo "Listing downloaded content:"
+                ls -la $(Pipeline.Workspace)/terraform/
+            displayName: 'Debug - List Downloads'  
+
+          # Step 3: unzip the build
+          - task: ExtractFiles@1
+            inputs:
+              archiveFilePatterns: '$(Pipeline.Workspace)/terraform/$(Build.BuildId).zip'  # Path to your downloaded .zip file
+              destinationFolder: '$(Pipeline.Workspace)/terraform/unzipped'  # Folder where you want the files extracted
+            displayName: 'Extract Terraform Plan'
+
+          # Add debug step after extraction
+          - task: Bash@3
+            inputs:
+              targetType: 'inline'
+              script: |
+                echo "Listing extracted content:"
+                ls -la $(Pipeline.Workspace)/terraform/unzipped/
+            displayName: 'Debug - List Extracted Files'
+
+          # Step 4: Initialize Terraform
+          - task: TerraformTaskV4@4
+            inputs:
+              provider: 'azurerm'
+              command: 'init'
+              workingDirectory: '$(unzipDirectory)'
+              backendAzureRmUseEnvironmentVariablesForAuthentication: true
+              backendAzureRmUseEntraIdForAuthentication: true
+              backendAzureRmResourceGroupName: $(backendAzureRmResourceGroupName)
+              backendAzureRmStorageAccountName: $(backendAzureRmStorageAccountName)
+              backendAzureRmContainerName: $(backendAzureRmContainerName)
+              backendAzureRmKey: $(backendAzureRmKey)
+              backendServiceArm: '$(backendServiceArm)' 
+            displayName: 'Terraform Init'
+
+          # Step 5: Apply Terraform Plan
+          - task: TerraformTaskV4@4
+            inputs:
+              provider: 'azurerm'
+              command: 'destroy'
+              commandOptions: '-auto-approve -input=false'
+              workingDirectory: '$(unzipDirectory)'
+              backendServiceArm: '$(backendServiceArm)' 
+              environmentServiceNameAzureRM: '$(backendServiceArm)'
+            displayName: 'Terraform Destroy'
