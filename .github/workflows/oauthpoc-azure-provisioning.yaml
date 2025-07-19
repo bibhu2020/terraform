@@ -1,0 +1,108 @@
+name: Terraform Workflow
+
+on:
+  # push:
+  #   branches:
+  #     - main
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v2
+
+      - name: Install Terraform
+        uses: hashicorp/setup-terraform@v1
+        with:
+          terraform_version: ${{ secrets.TERRAFORM_VERSION }}
+
+      - name: Cleanup Source Directory
+        run: |
+          echo "Cleaning up unnecessary directories..."
+          rm -rf _psmodules/ archives/ pocs/ utilityapps/ tfapps/isv/ tfapps/isv_db/ tfapps/isv_db_archive/ .git/ .github/
+          echo "Remaining files in source directory:"
+          ls -la
+
+      - name: Create terraform.tfvars file
+        run: |
+          echo "app = \"${{ secrets.TERRAFORM_APP }}\"" > terraform.tfvars
+          echo "env = \"${{ secrets.TERRAFORM_ENV }}\"" >> terraform.tfvars
+          echo "location = \"${{ secrets.TERRAFORM_LOCATION }}\"" >> terraform.tfvars
+          echo "subscription_id = \"${{ secrets.TERRAFORM_SUBSCRIPTION_ID }}\"" >> terraform.tfvars
+          echo "tenant_id = \"${{ secrets.TERRAFORM_TENANT_ID }}\"" >> terraform.tfvars
+          echo "owner = \"${{ secrets.TERRAFORM_OWNER }}\"" >> terraform.tfvars
+          echo "co-owner = \"${{ secrets.TERRAFORM_CO_OWNER }}\"" >> terraform.tfvars
+          echo "workitem = \"${{ secrets.TERRAFORM_WORKITEM }}\"" >> terraform.tfvars
+          mv terraform.tfvars ${{ github.workspace }}/tfapps/${{ secrets.TERRAFORM_APP }}/
+
+      - name: Create backend.tf file
+        run: |
+          echo "terraform {" > backend.tf
+          echo "  backend \"azurerm\" {" >> backend.tf
+          echo "    resource_group_name  = \"${{ secrets.BACKEND_AZURE_RM_RESOURCE_GROUP_NAME }}\"" >> backend.tf
+          echo "    storage_account_name  = \"${{ secrets.BACKEND_AZURE_RM_STORAGE_ACCOUNT_NAME }}\"" >> backend.tf
+          echo "    container_name  = \"${{ secrets.BACKEND_AZURE_RM_CONTAINER_NAME }}\"" >> backend.tf
+          echo "    key  = \"${{ secrets.BACKEND_AZURE_RM_KEY }}\"" >> backend.tf
+          echo "    use_azuread_auth  = true" >> backend.tf
+          echo "  }" >> backend.tf
+          echo "}" >> backend.tf
+          mv backend.tf ${{ github.workspace }}/tfapps/${{ secrets.TERRAFORM_APP }}/
+
+      - name: Terraform Init
+        run: |
+          cd tfapps/${{ secrets.TERRAFORM_APP }}
+          terraform init -backend-config="resource_group_name=${{ secrets.BACKEND_AZURE_RM_RESOURCE_GROUP_NAME }}" \
+                         -backend-config="storage_account_name=${{ secrets.BACKEND_AZURE_RM_STORAGE_ACCOUNT_NAME }}" \
+                         -backend-config="container_name=${{ secrets.BACKEND_AZURE_RM_CONTAINER_NAME }}" \
+                         -backend-config="key=${{ secrets.BACKEND_AZURE_RM_KEY }}"
+
+      - name: Terraform Validate
+        run: |
+          cd tfapps/${{ secrets.TERRAFORM_APP }}
+          terraform validate
+
+      - name: Terraform Plan
+        id: plan
+        run: |
+          cd tfapps/${{ secrets.TERRAFORM_APP }}
+          terraform plan -out=tfplan
+
+      - name: Archive Terraform Plan
+        uses: actions/upload-artifact@v2
+        with:
+          name: terraform-plan
+          path: tfplan
+
+  deploy:
+    runs-on: ubuntu-latest
+    needs: build
+    if: github.event_name == 'workflow_dispatch' || github.event_name == 'push'
+    steps:
+      - name: Download Terraform Plan
+        uses: actions/download-artifact@v2
+        with:
+          name: terraform-plan
+          path: .
+
+      - name: Terraform Apply
+        run: |
+          terraform apply -auto-approve tfplan
+
+  destroy:
+    runs-on: ubuntu-latest
+    needs: deploy
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.action == 'destroy'
+    steps:
+      - name: Download Terraform Plan
+        uses: actions/download-artifact@v2
+        with:
+          name: terraform-plan
+          path: .
+
+      - name: Terraform Destroy
+        run: |
+          terraform destroy -auto-approve
